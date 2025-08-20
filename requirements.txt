@@ -1,0 +1,874 @@
+# ========================================
+# 2. REQUIREMENTS.TXT
+# ========================================
+
+# requirements.txt
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+sqlalchemy==2.0.23
+alembic==1.12.1
+psycopg2-binary==2.9.9
+redis==5.0.1
+celery==5.3.4
+
+# LangChain and AI
+langchain==0.0.350
+langchain-experimental==0.0.45
+langchain-community==0.0.5
+openai==1.3.8
+anthropic==0.7.8
+google-generativeai==0.3.2
+azure-openai==1.3.8
+
+# Vector stores and embeddings
+chromadb==0.4.18
+faiss-cpu==1.7.4
+pinecone-client==2.2.4
+sentence-transformers==2.2.2
+
+# Document processing
+PyPDF2==3.0.1
+python-docx==1.1.0
+python-multipart==0.0.6
+unstructured==0.11.6
+beautifulsoup4==4.12.2
+pandas==2.1.4
+openpyxl==3.1.2
+pypandoc==1.12
+
+# Security and authentication
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+python-multipart==0.0.6
+bleach==6.1.0
+
+# Monitoring and observability
+prometheus-client==0.19.0
+structlog==23.2.0
+sentry-sdk[fastapi]==1.38.0
+
+# External integrations
+requests==2.31.0
+atlassian-python-api==3.41.10
+jira==3.5.2
+
+# Development and testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+black==23.11.0
+flake8==6.1.0
+mypy==1.7.1
+
+# ========================================
+# 3. DOCKER-COMPOSE.YML
+# ========================================
+
+# docker-compose.yml
+version: '3.8'
+
+services:
+  # Main application
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@db:5432/userstories
+      - REDIS_URL=redis://redis:6379
+      - APP_CONFIG_FILE=/app/config/app_config.json
+    volumes:
+      - ./uploads:/app/uploads
+      - ./chroma_db:/app/chroma_db
+      - ./logs:/app/logs
+      - ./config:/app/config
+    depends_on:
+      - db
+      - redis
+      - chromadb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=userstories
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+
+  # ChromaDB Vector Database
+  chromadb:
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - CHROMA_SERVER_HOST=0.0.0.0
+      - CHROMA_SERVER_HTTP_PORT=8000
+    restart: unless-stopped
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/nginx/ssl
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+    restart: unless-stopped
+
+  # Grafana Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # Celery Worker for Background Tasks
+  celery-worker:
+    build: .
+    command: celery -A main.celery worker --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@db:5432/userstories
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./uploads:/app/uploads
+      - ./chroma_db:/app/chroma_db
+      - ./logs:/app/logs
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+
+  # Celery Beat Scheduler
+  celery-beat:
+    build: .
+    command: celery -A main.celery beat --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@db:5432/userstories
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  chroma_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  default:
+    driver: bridge
+
+# ========================================
+# 4. NGINX CONFIGURATION
+# ========================================
+
+# nginx.conf
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream app {
+        server app:8000;
+    }
+
+    # Rate limiting
+    limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+    limit_req_zone $binary_remote_addr zone=upload:10m rate=1r/s;
+
+    # Security headers
+    add_header X-Frame-Options DENY;
+    add_header X-Content-Type-Options nosniff;
+    add_header X-XSS-Protection "1; mode=block";
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains";
+
+    server {
+        listen 80;
+        server_name _;
+
+        # Redirect HTTP to HTTPS
+        return 301 https://$server_name$request_uri;
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name _;
+
+        # SSL Configuration
+        ssl_certificate /etc/nginx/ssl/cert.pem;
+        ssl_certificate_key /etc/nginx/ssl/key.pem;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
+        ssl_prefer_server_ciphers off;
+
+        # File upload limits
+        client_max_body_size 100M;
+        client_body_timeout 300s;
+
+        # Static files
+        location /static/ {
+            alias /app/static/;
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+
+        # API endpoints with rate limiting
+        location /api/ {
+            limit_req zone=api burst=20 nodelay;
+            proxy_pass http://app;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 300s;
+            proxy_connect_timeout 300s;
+        }
+
+        # File upload endpoint with strict rate limiting
+        location /api/upload {
+            limit_req zone=upload burst=5 nodelay;
+            proxy_pass http://app;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 600s;
+            proxy_connect_timeout 300s;
+        }
+
+        # WebSocket support for real-time updates
+        location /ws/ {
+            proxy_pass http://app;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Main application
+        location / {
+            proxy_pass http://app;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Health check
+        location /health {
+            access_log off;
+            proxy_pass http://app/api/health;
+        }
+    }
+}
+
+# ========================================
+# 5. PROMETHEUS CONFIGURATION
+# ========================================
+
+# prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  - job_name: 'ai-user-story-generator'
+    static_configs:
+      - targets: ['app:8000']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+# ========================================
+# 6. DEPLOYMENT SCRIPTS
+# ========================================
+
+# deploy.sh
+#!/bin/bash
+set -e
+
+echo "🚀 Starting AI User Story Generator deployment..."
+
+# Configuration
+PROJECT_NAME="ai-user-story-generator"
+DEPLOY_DIR="/opt/${PROJECT_NAME}"
+BACKUP_DIR="/opt/backups/${PROJECT_NAME}"
+DOCKER_COMPOSE_FILE="docker-compose.yml"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Functions
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Check if running as root
+if [[ $EUID -eq 0 ]]; then
+   log_error "This script should not be run as root for security reasons"
+   exit 1
+fi
+
+# Check prerequisites
+check_prerequisites() {
+    log_info "Checking prerequisites..."
+    
+    # Check Docker
+    if ! command -v docker &> /dev/null; then
+        log_error "Docker is not installed. Please install Docker first."
+        exit 1
+    fi
+    
+    # Check Docker Compose
+    if ! command -v docker-compose &> /dev/null; then
+        log_error "Docker Compose is not installed. Please install Docker Compose first."
+        exit 1
+    fi
+    
+    # Check if user is in docker group
+    if ! groups | grep -q docker; then
+        log_error "Current user is not in the docker group. Please add user to docker group."
+        exit 1
+    fi
+    
+    log_info "Prerequisites check passed ✅"
+}
+
+# Create backup
+create_backup() {
+    if [ -d "$DEPLOY_DIR" ]; then
+        log_info "Creating backup of existing deployment..."
+        sudo mkdir -p "$BACKUP_DIR"
+        sudo cp -r "$DEPLOY_DIR" "$BACKUP_DIR/backup-$(date +%Y%m%d-%H%M%S)"
+        log_info "Backup created ✅"
+    fi
+}
+
+# Setup directories and permissions
+setup_deployment() {
+    log_info "Setting up deployment directory..."
+    
+    sudo mkdir -p "$DEPLOY_DIR"
+    sudo mkdir -p "$DEPLOY_DIR"/{uploads,chroma_db,logs,config,ssl}
+    
+    # Copy application files
+    sudo cp -r . "$DEPLOY_DIR/"
+    
+    # Set permissions
+    sudo chown -R $USER:$USER "$DEPLOY_DIR"
+    chmod +x "$DEPLOY_DIR/deploy.sh"
+    chmod +x "$DEPLOY_DIR/backup.sh"
+    
+    log_info "Deployment directory setup complete ✅"
+}
+
+# Generate SSL certificates
+generate_ssl() {
+    log_info "Generating SSL certificates..."
+    
+    SSL_DIR="$DEPLOY_DIR/ssl"
+    
+    if [ ! -f "$SSL_DIR/cert.pem" ]; then
+        openssl req -x509 -newkey rsa:4096 -keyout "$SSL_DIR/key.pem" \
+            -out "$SSL_DIR/cert.pem" -days 365 -nodes \
+            -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
+        
+        chmod 600 "$SSL_DIR/key.pem"
+        chmod 644 "$SSL_DIR/cert.pem"
+        
+        log_info "SSL certificates generated ✅"
+    else
+        log_info "SSL certificates already exist, skipping generation"
+    fi
+}
+
+# Setup configuration
+setup_config() {
+    log_info "Setting up configuration..."
+    
+    CONFIG_FILE="$DEPLOY_DIR/config/app_config.json"
+    
+    if [ ! -f "$CONFIG_FILE" ]; then
+        cat > "$CONFIG_FILE" << EOF
+{
+    "llm": {
+        "provider": "openai",
+        "model_name": "gpt-4",
+        "api_key": "your-api-key-here",
+        "temperature": 0.7,
+        "max_tokens": 2000
+    },
+    "rag": {
+        "chunk_size": 1000,
+        "chunk_overlap": 200,
+        "vector_store": "chroma",
+        "similarity_threshold": 0.7,
+        "max_retrieved_docs": 5
+    },
+    "security": {
+        "jwt_secret": "$(openssl rand -base64 32)",
+        "jwt_algorithm": "HS256",
+        "access_token_expire_minutes": 30,
+        "rate_limit_requests": 100,
+        "rate_limit_window": 3600
+    },
+    "integrations": {
+        "confluence_base_url": null,
+        "confluence_username": null,
+        "confluence_api_token": null,
+        "jira_base_url": null,
+        "jira_username": null,
+        "jira_api_token": null
+    },
+    "redis_url": "redis://redis:6379",
+    "database_url": "postgresql://postgres:password@db:5432/userstories",
+    "upload_dir": "./uploads",
+    "max_file_size": 52428800
+}
+EOF
+        
+        log_warn "Configuration file created at $CONFIG_FILE"
+        log_warn "Please update the configuration with your API keys and settings!"
+    fi
+}
+
+# Deploy application
+deploy_application() {
+    log_info "Deploying application..."
+    
+    cd "$DEPLOY_DIR"
+    
+    # Pull latest images
+    docker-compose pull
+    
+    # Build application image
+    docker-compose build
+    
+    # Start services
+    docker-compose up -d
+    
+    # Wait for services to be ready
+    log_info "Waiting for services to be ready..."
+    sleep 30
+    
+    # Check health
+    if curl -f http://localhost:8000/api/health > /dev/null 2>&1; then
+        log_info "Application deployed successfully ✅"
+        log_info "Application is available at: http://localhost:8000"
+        log_info "Grafana dashboard: http://localhost:3000 (admin/admin)"
+        log_info "Prometheus: http://localhost:9090"
+    else
+        log_error "Application health check failed!"
+        docker-compose logs app
+        exit 1
+    fi
+}
+
+# Main deployment process
+main() {
+    log_info "🚀 AI User Story Generator Deployment Script"
+    echo "================================================"
+    
+    check_prerequisites
+    create_backup
+    setup_deployment
+    generate_ssl
+    setup_config
+    deploy_application
+    
+    echo "================================================"
+    log_info "🎉 Deployment completed successfully!"
+    echo ""
+    log_info "Next steps:"
+    echo "1. Update configuration at: $DEPLOY_DIR/config/app_config.json"
+    echo "2. Restart services: cd $DEPLOY_DIR && docker-compose restart"
+    echo "3. Monitor logs: cd $DEPLOY_DIR && docker-compose logs -f"
+    echo "4. Access application: http://localhost:8000"
+}
+
+# Run main function
+main "$@"
+
+# ========================================
+# 7. BACKUP SCRIPT
+# ========================================
+
+# backup.sh
+#!/bin/bash
+set -e
+
+PROJECT_NAME="ai-user-story-generator"
+DEPLOY_DIR="/opt/${PROJECT_NAME}"
+BACKUP_DIR="/opt/backups/${PROJECT_NAME}"
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+
+echo "🔄 Starting backup process..."
+
+# Create backup directory
+mkdir -p "$BACKUP_DIR"
+
+# Stop services
+cd "$DEPLOY_DIR"
+docker-compose stop
+
+# Backup databases
+echo "📊 Backing up PostgreSQL database..."
+docker-compose exec -T db pg_dump -U postgres userstories > "$BACKUP_DIR/postgres-$TIMESTAMP.sql"
+
+echo "📊 Backing up Redis data..."
+docker-compose exec -T redis redis-cli --rdb - > "$BACKUP_DIR/redis-$TIMESTAMP.rdb"
+
+# Backup vector database
+echo "🔍 Backing up ChromaDB..."
+tar -czf "$BACKUP_DIR/chromadb-$TIMESTAMP.tar.gz" -C "$DEPLOY_DIR" chroma_db/
+
+# Backup uploads
+echo "📁 Backing up uploaded files..."
+tar -czf "$BACKUP_DIR/uploads-$TIMESTAMP.tar.gz" -C "$DEPLOY_DIR" uploads/
+
+# Backup configuration
+echo "⚙️ Backing up configuration..."
+tar -czf "$BACKUP_DIR/config-$TIMESTAMP.tar.gz" -C "$DEPLOY_DIR" config/
+
+# Start services
+docker-compose start
+
+# Clean old backups (keep last 7 days)
+find "$BACKUP_DIR" -name "*.sql" -mtime +7 -delete
+find "$BACKUP_DIR" -name "*.rdb" -mtime +7 -delete
+find "$BACKUP_DIR" -name "*.tar.gz" -mtime +7 -delete
+
+echo "✅ Backup completed: $BACKUP_DIR"
+
+# ========================================
+# 8. UPDATE SCRIPT
+# ========================================
+
+# update.sh
+#!/bin/bash
+set -e
+
+PROJECT_NAME="ai-user-story-generator"
+DEPLOY_DIR="/opt/${PROJECT_NAME}"
+
+echo "🔄 Starting update process..."
+
+cd "$DEPLOY_DIR"
+
+# Create backup before update
+./backup.sh
+
+# Pull latest changes (if using git)
+if [ -d ".git" ]; then
+    git pull origin main
+fi
+
+# Rebuild and restart services
+docker-compose build
+docker-compose up -d
+
+# Run database migrations
+docker-compose exec app alembic upgrade head
+
+# Health check
+sleep 30
+if curl -f http://localhost:8000/api/health > /dev/null 2>&1; then
+    echo "✅ Update completed successfully!"
+else
+    echo "❌ Update failed - rolling back..."
+    # Rollback logic here
+    exit 1
+fi
+
+# ========================================
+# 9. MONITORING SETUP
+# ========================================
+
+# setup-monitoring.sh
+#!/bin/bash
+
+echo "📊 Setting up monitoring stack..."
+
+# Create Grafana dashboards directory
+mkdir -p grafana/dashboards
+
+# Create Grafana dashboard for AI User Story Generator
+cat > grafana/dashboards/ai-userstory-dashboard.json << 'EOF'
+{
+  "dashboard": {
+    "id": null,
+    "title": "AI User Story Generator Metrics",
+    "tags": ["ai", "fastapi", "production"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "title": "Request Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(http_requests_total[5m])",
+            "legendFormat": "{{method}} {{endpoint}}"
+          }
+        ]
+      },
+      {
+        "title": "Response Time",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "95th percentile"
+          }
+        ]
+      },
+      {
+        "title": "Error Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(http_requests_total{status=~\"5..\"}[5m])",
+            "legendFormat": "5xx errors"
+          }
+        ]
+      }
+    ],
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "refresh": "30s"
+  }
+}
+EOF
+
+echo "✅ Monitoring setup completed!"
+
+# ========================================
+# 10. PRODUCTION CHECKLIST
+# ========================================
+
+# production-checklist.md
+echo "📋 Production Deployment Checklist" > production-checklist.md
+cat >> production-checklist.md << 'EOF'
+
+## Pre-Deployment
+- [ ] Update API keys in config/app_config.json
+- [ ] Configure SSL certificates
+- [ ] Set up domain name and DNS
+- [ ] Configure firewall rules
+- [ ] Set up backup storage (S3, etc.)
+- [ ] Configure log rotation
+- [ ] Set up monitoring alerts
+
+## Security
+- [ ] Enable HTTPS only
+- [ ] Configure rate limiting
+- [ ] Set up WAF (Web Application Firewall)
+- [ ] Enable audit logging
+- [ ] Configure CORS properly
+- [ ] Set strong JWT secrets
+- [ ] Enable database encryption
+
+## Performance
+- [ ] Configure Redis cache settings
+- [ ] Optimize database indexes
+- [ ] Set up CDN for static files
+- [ ] Configure auto-scaling
+- [ ] Enable compression
+- [ ] Set up health checks
+
+## Monitoring
+- [ ] Configure Prometheus alerts
+- [ ] Set up Grafana dashboards
+- [ ] Configure log aggregation
+- [ ] Set up uptime monitoring
+- [ ] Configure error tracking (Sentry)
+- [ ] Set up performance monitoring
+
+## High Availability
+- [ ] Set up load balancer
+- [ ] Configure database replication
+- [ ] Set up Redis clustering
+- [ ] Configure auto-restart policies
+- [ ] Set up disaster recovery plan
+- [ ] Test failover procedures
+
+## Compliance
+- [ ] GDPR compliance review
+- [ ] SOC 2 compliance
+- [ ] Data retention policies
+- [ ] Privacy policy updates
+- [ ] Security audit
+- [ ] Penetration testing
+
+EOF
+
+echo "✅ All deployment files created successfully!"
+echo ""
+echo "📁 Files created:"
+echo "  - Dockerfile"
+echo "  - requirements.txt"
+echo "  - docker-compose.yml"
+echo "  - nginx.conf"
+echo "  - prometheus.yml"
+echo "  - deploy.sh"
+echo "  - backup.sh"
+echo "  - update.sh"
+echo "  - setup-monitoring.sh"
+echo "  - production-checklist.md"
+echo ""
+echo "🚀 To deploy:"
+echo "  1. chmod +x deploy.sh"
+echo "  2. ./deploy.sh"
+echo "  3. Update config/app_config.json with your API keys"
+echo "  4. docker-compose restart" 1. DOCKERFILE
+# ========================================
+
+FROM python:3.11-slim
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    curl \
+    postgresql-client \
+    redis-tools \
+    poppler-utils \
+    tesseract-ocr \
+    libreoffice \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app user
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+# Set work directory
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create necessary directories
+RUN mkdir -p /app/uploads /app/chroma_db /app/logs /app/static
+RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/api/health || exit 1
+
+# Start application
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+
+# ========================================
+#
